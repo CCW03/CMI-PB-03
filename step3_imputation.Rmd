@@ -1,0 +1,101 @@
+---
+title: "step3_imputation"
+author: "Cheng-Chang"
+date: "2024-10-20"
+output: html_document
+---
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+base_dir = "../"
+
+library(ggplot2)
+library(ggfortify)
+library(dplyr)
+library(tidyverse)
+library(reshape2)
+select <- dplyr::select
+rm(list=ls())
+# final_df <- readRDS(file = "final_df.RDS")
+```
+
+```{r, eval = FALSE}
+clinical_var <- c(1:15)
+# clinical_var <- c(1:15, 500:ncol(final_df))
+gene_mat <- as.matrix(final_df[, -clinical_var]) 
+
+subj_id <- unique(final_df$subject_id)
+time <- unique(final_df$timepoint)
+n_genes <- ncol(gene_mat)
+
+expand <- expand_grid(subj_id, time)
+
+gene_tensor <- array(NA, dim = c(length(subj_id), n_genes, length(time)),
+                     dimnames = list(subject_id = subj_id, gene = colnames(gene_mat), timepoint = time))
+
+ten_name <- dimnames(gene_tensor)
+
+for (i in 1:nrow(expand)){
+  subj_idx <- as.numeric(expand[i,1])
+  time_idx <- as.numeric(expand[i,2])
+
+  print(paste("Subject Index:", subj_idx, "Time Index:", time_idx))
+
+  ten_subj_i <- which(ten_name$subject_id == subj_idx)  # Index for subject_id
+  ten_time_i <- which(ten_name$timepoint == time_idx)  # Index for timepoint
+  
+  if (nrow(final_df[final_df$subject_id == subj_idx & final_df$timepoint == time_idx,-clinical_var]) != 0){
+    gene_tensor[ten_subj_i, , ten_time_i] <- as.matrix(final_df[final_df$subject_id == subj_idx & final_df$timepoint == time_idx,-clinical_var])
+  }
+}
+```
+
+```{r, eval = FALSE}
+tensor_obj <- list(clinical = final_df[, clinical_var],
+                   exp_tensor = gene_tensor)
+
+# saveRDS(tensor_obj, file = "/Users/chengchangwu/Documents/Competition/3RD CMI-PB Competition/pipeline/tensor.RDS")
+```
+
+```{r}
+tensor_obj <- readRDS(file = "tensor.RDS")
+ten_name <- dimnames(tensor_obj$exp_tensor)
+```
+
+# IgG antibody levels against pertussis toxin (PT) on day 14 (IgG_PT)
+# frequency of Monocytes on day 1
+# gene expression of CCL3 on day 3 
+# predicted Th1/Th2 (IFN-γ/IL-5) polarization ratio on day 30
+
+```{r}
+# impute tensor
+exp_ten <- tensor_obj$exp_tensor
+task1 <- "IgG_PT"
+task2 <- "Monocytes"
+task3 <- "ENSG00000277632.1"
+
+task_idx <- which(ten_name$gene == task1)
+test <- exp_ten[,task_idx,]
+
+# Melt the tensor to long format
+long_gene_df <- melt(test, varnames = c("subject_id", "timepoint")) %>%
+  mutate(subject_id = as.factor(subject_id))
+
+# Create a line plot for each subject
+ggplot(long_gene_df, aes(x = timepoint, y = exp(value), group = subject_id, color = subject_id)) +
+  geom_line() +
+  labs(x = "Timepoint", y = "Gene Expression") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r}
+# install.packages("tensorMiss")
+# install.packages("TensorComplete")
+library(tensorMiss)
+est_result <- miss_factor_est(exp_ten)
+```
+
+```{r}
+# saveRDS(est_result, file ="est.tensor.RDS")
+```

@@ -1,0 +1,462 @@
+---
+title: "CMI-PB Team's Data Processing Approach for Second Challenge Dataset"
+#date: "Last update: `r format(Sys.time(), '%d %B, %Y')`" 
+output:
+  BiocStyle::html_document:
+    toc: true
+    toc_float:
+        collapsed: true
+        smooth_scroll: true
+    toc_depth: 3
+    fig_caption: yes
+    code_folding: show
+    number_sections: false
+date: "2023-08-21"
+---
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+base_dir = "../"
+
+library(limma)
+library(edgeR)
+library(impute)
+library(ggplot2)
+library(ggfortify)
+library(sva)
+library(dplyr)
+library(tidyverse)
+select <- dplyr::select
+rm(list=ls())
+master_database_data <- readRDS("master_harmonized_training_data.RDS")
+
+subject_specimen <- master_database_data$subject_specimen %>% 
+  mutate(timepoint = planned_day_relative_to_boost)
+
+df_subject_specimen <- master_database_data$subject_specimen
+
+batch.factors = c("timepoint","infancy_vac","biological_sex","dataset")
+data_obj = master_database_data
+```
+
+```{r}
+# antibody normalize
+anti_raw <- data_obj$plasma_antibody_levels$wide %>%
+  left_join(df_subject_specimen %>% select(specimen_id, data, timepoint),  by = "specimen_id") %>%
+  filter(timepoint %in% c(0, 1, 3, 7, 14, 30)) %>%
+  select(-timepoint)
+
+anti_z <- anti_raw %>%
+  group_by(data) %>%
+    mutate(across(-1, ~ {  
+    log_vals <- log(. + 1)  
+    mean_val <- mean(log_vals, na.rm = TRUE)
+    sd_val <- sd(log_vals, na.rm = TRUE)    
+    (log_vals - mean_val) / sd_val  
+  })) %>%
+  ungroup()
+
+
+miss_prec <- apply(anti_z[,-c(1,29)], 2, function(x) {
+  mean(is.na(x)) * 100  
+})
+
+feature_var <- apply(anti_z[,-c(1,29)], 2, function(x) {
+  var(x, na.rm = TRUE) 
+})
+
+get_mode <- function(x) {
+  unique_x <- unique(x[!is.na(x)])  # Remove NAs and get unique values
+  unique_x[which.max(tabulate(match(x, unique_x)))]  # Find the most frequent value
+}
+
+mode_percentage <- apply(anti_z[,-c(1,29)], 2, function(x) {
+  mode_val <- get_mode(x)  # Get the mode of the column
+  mean(x == mode_val, na.rm = TRUE) * 100  # Calculate the percentage of the mode
+})
+
+anti.data.q <- data.frame(
+  Column = names(anti_z[,-c(1,29)]),
+  Miss = miss_prec,
+  Vare = feature_var,
+  Mode_Perc = mode_percentage  
+)
+
+counts <- anti_z[,-c(1,29)]
+
+demo_anti <- anti_raw %>% select(specimen_id) %>%
+      left_join(df_subject_specimen, by = "specimen_id")
+
+batch_lb <- demo_anti %>% select(dataset)
+anti.mod <- model.matrix( ~ infancy_vac + biological_sex, data = demo_anti) # cavoariates
+
+anti.corr <- t(ComBat(dat = t(counts), batch = batch_lb$dataset, mod = anti.mod))
+
+anti.fin <- cbind(demo_anti, anti.corr)
+
+col <- as.numeric(as.factor(batch_lb$dataset))
+
+# visualization
+raw <- t(anti_raw[,-c(1,29)]) %>% impute.knn()
+pca_raw <- prcomp(t(raw$data), scale. = TRUE)
+autoplot(pca_raw, colour = col)
+
+nrm <- t(counts) %>% impute.knn()
+pca_nrm <- prcomp(t(nrm$data), scale. = TRUE)
+autoplot(pca_nrm, colour = col)
+
+cor <- t(anti.corr) %>% impute.knn()
+pca_cor <- prcomp(t(cor$data), scale. = TRUE)
+autoplot(pca_cor, colour = col)
+```
+
+```{r}
+
+
+
+# cytokine
+cyto_raw <- data_obj$plasma_cytokine_concentrations$wide %>%
+  left_join(df_subject_specimen %>% select(specimen_id, data, timepoint),  by = "specimen_id") %>%
+  filter(timepoint %in% c(0, 1, 3, 7, 14, 30)) %>%
+  select(-timepoint)
+
+same_value_check <- cyto_raw %>%
+  group_by(data) %>%
+  summarise(across(where(is.numeric),  # Apply to all numeric columns
+                   ~ all(. == first(na.omit(.))),  # Check if all values are the same (ignoring NAs)
+                   .names = "{.col}")) %>%
+  ungroup()  # Ungroup after summarising
+
+# if values are the same with in same batch, randomly impute as other value to make Combat work (will address later)
+year_vec <- c("2020", "2021", "2022", "2023")
+cyto_na <- cyto_raw[,-c(1,32)]
+for (i in 1:4){
+  year = year_vec[i]
+  for (j in 1:30){
+    if (same_value_check[i,(j+2)] == TRUE){
+      rnd_idx <- sample(nrow(cyto_raw), sum(cyto_raw$data == year), replace = TRUE)
+      cyto_na[cyto_raw$data == year, (j)] <- NA
+      cyto_raw[cyto_raw$data == year, (j+1)] <- cyto_raw[rnd_idx, (j+1)]
+    }
+  }
+}
+
+na.cyto <- is.na(cyto_na)
+
+cyto_z <- cyto_raw %>%
+  group_by(data) %>%
+    mutate(across(-1, ~ {  
+    log_vals <- log(. + 1)  
+    mean_val <- mean(log_vals, na.rm = TRUE)
+    sd_val <- sd(log_vals, na.rm = TRUE)    
+    (log_vals - mean_val) / sd_val  
+  })) %>%
+  ungroup()
+
+miss_prec <- apply(cyto_z[,-c(1,32)], 2, function(x) {
+  mean(is.na(x)) * 100  
+})
+
+feature_var <- apply(cyto_z[,-c(1,32)], 2, function(x) {
+  var(x, na.rm = TRUE) 
+})
+
+get_mode <- function(x) {
+  unique_x <- unique(x[!is.na(x)])  # Remove NAs and get unique values
+  unique_x[which.max(tabulate(match(x, unique_x)))]  # Find the most frequent value
+}
+
+mode_percentage <- apply(cyto_z[,-c(1,32)], 2, function(x) {
+  mode_val <- get_mode(x)  # Get the mode of the column
+  mean(x == mode_val, na.rm = TRUE) * 100  # Calculate the percentage of the mode
+})
+
+cyto.data.q <- data.frame(
+  Column = names(cyto_z[,-c(1,32)]),
+  Miss = miss_prec,
+  Vare = feature_var,
+  Mode_Perc = mode_percentage  
+)
+
+counts <- cyto_z[,-c(1,32)]
+
+demo_cyto <- cyto_z %>% select(specimen_id) %>%
+      left_join(df_subject_specimen, by = "specimen_id")
+
+batch_lb <- demo_cyto %>% select(dataset)
+# anti.mod <- model.matrix( ~ infancy_vac + biological_sex + timepoint + subject_id, data = demo_anti) # cavoariates
+cyto.mod <- model.matrix( ~ infancy_vac + biological_sex, data = demo_cyto) # cavoariates
+
+cyto.corr <- t(ComBat(dat = t(counts), batch = batch_lb$dataset, mod = cyto.mod))
+
+cyto.corr[na.cyto] <- NA
+
+cyto.fin <- cbind(demo_cyto, cyto.corr)
+
+col <- as.numeric(as.factor(batch_lb$dataset))
+
+# visualization
+raw <- t(cyto_raw[,-c(1,32)]) %>% impute.knn()
+pca_raw <- prcomp(t(raw$data), scale. = TRUE)
+autoplot(pca_raw, colour = col) 
+
+nrm <- t(counts) %>% impute.knn()
+pca_nrm <- prcomp(t(nrm$data), scale. = TRUE)
+autoplot(pca_nrm, colour = col)
+
+cor <- t(cyto.corr) %>% impute.knn()
+pca_cor <- prcomp(t(cor$data), scale. = TRUE)
+autoplot(pca_cor, colour = col)
+```
+
+```{r}
+# cell frequency
+cell_raw <- data_obj$pbmc_cell_frequency_wide$wide %>% select(-data) %>%
+  left_join(df_subject_specimen %>% select(specimen_id, data, timepoint),  by = "specimen_id") %>%
+  filter(timepoint %in% c(0, 1, 3, 7, 14, 30)) %>%
+  select(-timepoint)
+
+cell_z <- cell_raw %>%
+   group_by(data) %>%
+    mutate(across(-1, ~ {  
+    log_vals <- log(. + 1)  
+    mean_val <- mean(log_vals, na.rm = TRUE)
+    sd_val <- sd(log_vals, na.rm = TRUE)    
+    (log_vals - mean_val) / sd_val  
+  })) %>%
+  ungroup()
+
+
+miss_prec <- apply(cell_z[,-c(1,22)], 2, function(x) {
+  mean(is.na(x)) * 100  
+})
+
+feature_var <- apply(cell_z[,-c(1,22)], 2, function(x) {
+  var(x, na.rm = TRUE) 
+})
+
+get_mode <- function(x) {
+  unique_x <- unique(x[!is.na(x)])  # Remove NAs and get unique values
+  unique_x[which.max(tabulate(match(x, unique_x)))]  # Find the most frequent value
+}
+
+mode_percentage <- apply(cell_z[,-c(1,22)], 2, function(x) {
+  mode_val <- get_mode(x)  # Get the mode of the column
+  mean(x == mode_val, na.rm = TRUE) * 100  # Calculate the percentage of the mode
+})
+
+cell.data.q <- data.frame(
+  Column = names(cell_z[,-c(1,22)]),
+  Miss = miss_prec,
+  Vare = feature_var,
+  Mode_Perc = mode_percentage  
+)
+
+counts <- cell_z[,-c(1,22)]
+
+miss_prec <- counts %>%
+  summarise(across(everything(), ~ mean(is.na(.)) * 100))
+
+feature_var <- counts %>%
+  summarise(across(everything(), ~ var(., na.rm = TRUE)))
+
+demo_cell <- cell_z %>% select(specimen_id) %>%
+      left_join(df_subject_specimen, by = "specimen_id")
+
+batch_lb <- demo_cell %>% select(dataset)
+# cell.mod <- model.matrix( ~ infancy_vac + biological_sex + timepoint + subject_id, data = demo_cell) # cavoariates
+
+cell.mod <- model.matrix( ~ infancy_vac + biological_sex, data = demo_cell) # cavoariates
+
+cell.corr <- t(ComBat(dat = t(counts), batch = batch_lb$dataset, mod = cell.mod))
+
+cell.fin <- cbind(demo_cell, cell.corr)
+
+col <- as.numeric(as.factor(batch_lb$dataset))
+
+# visualization
+raw <- t(cell_raw[,-c(1,22)]) %>% impute.knn()
+pca_raw <- prcomp(t(raw$data), scale. = TRUE)
+autoplot(pca_raw, colour = col)
+
+nrm <- t(counts) %>% impute.knn()
+pca_nrm <- prcomp(t(nrm$data), scale. = TRUE)
+autoplot(pca_nrm, colour = col)
+
+cor <- t(cell.corr) %>% impute.knn()
+pca_cor <- prcomp(t(cor$data), scale. = TRUE)
+autoplot(pca_cor, colour = col)
+```
+
+```{r}
+# gene_freq
+gene_raw <- data_obj$pbmc_gene_expression_wide$wide %>%
+  left_join(df_subject_specimen %>% select(specimen_id, data, timepoint),  by = "specimen_id") %>%
+  filter(timepoint %in% c(0, 1, 3, 7, 14, 30)) %>%
+  select(-timepoint)
+
+# gene_raw <- gene_raw[,c(1:1000, ncol(gene_raw))]
+
+numeric_data <- as.matrix(gene_raw[,-c(1, ncol(gene_raw))])
+data_groups <- unique(gene_raw$data)
+gene_z <- numeric_data
+for (year in data_groups) {
+  group_idx <- gene_raw$data == year
+  subset_data <- numeric_data[group_idx, ]
+  log_data <- log(subset_data + 1)
+  mean_vals <- apply(log_data, 2, mean, na.rm = TRUE)
+  sd_vals <- apply(log_data, 2, sd, na.rm = TRUE)
+  gene_z[group_idx, ] <- sweep(log_data, 2, mean_vals, FUN = "-")
+  gene_z[group_idx, ] <- sweep(gene_z[group_idx, ], 2, sd_vals, FUN = "/")
+}
+
+gene_z <- cbind(specimen_id = gene_raw$specimen_id, gene_z, data = gene_raw$data) %>% as.data.frame()
+gene_z[,-c(ncol(gene_z))] <- apply(gene_z[,-c(ncol(gene_z))], 2, as.numeric)
+ 
+# gene_z <- gene_raw %>%
+#    group_by(data) %>%
+#     mutate(across(-1, ~ {  
+#     log_vals <- log(. + 1)  
+#     mean_val <- mean(log_vals, na.rm = TRUE)
+#     sd_val <- sd(log_vals, na.rm = TRUE)    
+#     (log_vals - mean_val) / sd_val  
+#   })) %>%
+#   ungroup()
+
+miss_prec <- apply(gene_z[,-c(1, ncol(gene_z))], 2, function(x) {
+  mean(is.na(x)) * 100  
+})
+
+feature_var <- apply(gene_z[,-c(1, ncol(gene_z))], 2, function(x) {
+  var(x, na.rm = TRUE) 
+})
+
+get_mode <- function(x) {
+  unique_x <- unique(x[!is.na(x)])  # Remove NAs and get unique values
+  unique_x[which.max(tabulate(match(x, unique_x)))]  # Find the most frequent value
+}
+
+mode_percentage <- apply(gene_z[,-c(1, ncol(gene_z))], 2, function(x) {
+  mode_val <- get_mode(x)  # Get the mode of the column
+  mean(x == mode_val, na.rm = TRUE) * 100  # Calculate the percentage of the mode
+})
+
+gene.data.q <- data.frame(
+  Column = names(gene_z[,-c(1, ncol(gene_z))]),
+  Miss = miss_prec,
+  Vare = feature_var,
+  Mode_Perc = mode_percentage  
+)
+
+miss_idx <- which(gene.data.q$Miss > 50)
+mode_idx <- which(gene.data.q$Mode_Perc > 80)
+  
+rm_idx <- unique(c(miss_idx, mode_idx))
+
+gene_z <- gene_z[,-(rm_idx+1)]
+gene_raw_pt <- gene_raw[,-(rm_idx+1)]
+
+# Convert the list to a data frame
+numeric_data <- as.matrix(gene_z[,-c(1, ncol(gene_z))])  
+data_groups <- unique(gene_z$data)
+same_value_check <- list()
+for (year in data_groups) {
+  subset_data <- numeric_data[gene_z$data == year, ]
+  same_values <- apply(subset_data, 2, function(x) {
+    all(x == x[1], na.rm = TRUE)  # Check if all values are the same, ignoring NAs
+  })
+  same_value_check[[year]] <- same_values
+}
+
+same_value_check_df <- as.data.frame(do.call(rbind, same_value_check))
+rownames(same_value_check_df) <- data_groups
+
+all_true_gene <- which(colSums(same_value_check_df) == 4)
+
+# remove if each batch has all the same values
+if (sum(all_true_gene) != 0){
+  gene_z <- gene_z[,-(1+all_true_gene)]
+  same_value_check_df <- same_value_check_df[,-all_true_gene]
+  gene_raw_pt <- gene_raw_pt[,-all_true_gene]
+}
+
+# if values are the same with in same batch, randomly impute as other value to make Combat work (will address later)
+year_vec <- c("2020", "2021", "2022", "2023")
+gene_na <- gene_z[,-c(1, ncol(gene_z))]
+
+pb <- txtProgressBar(min = 1, max = ncol(same_value_check_df)*4, style = 3)
+cur_case <- 0
+
+for (i in 1:4){
+  year = year_vec[i]
+  for (j in 1:ncol(same_value_check_df)){
+    if (same_value_check_df[i,j] == TRUE){
+      rnd_idx <- sample(nrow(gene_z), sum(gene_z$data == year), replace = TRUE)
+      gene_na[gene_z$data == year, j] <- NA
+      gene_z[gene_z$data == year, (j+1)] <- gene_z[rnd_idx, (j+1)]
+    }
+    # progress
+    cur_case <- cur_case + 1
+    setTxtProgressBar(pb, cur_case)
+  }
+}
+
+na.gene <- is.na(gene_na)
+
+counts <- gene_z[,-c(1, ncol(gene_z))]
+
+demo_gene <- gene_z %>% select(specimen_id) %>%
+      left_join(df_subject_specimen, by = "specimen_id")
+
+batch_lb <- demo_gene %>% select(dataset)
+# cell.mod <- model.matrix( ~ infancy_vac + biological_sex + timepoint + subject_id, data = demo_cell) # cavoariates
+gene.mod <- model.matrix( ~ infancy_vac + biological_sex, data = demo_gene) # cavoariates
+
+gene.corr <- t(ComBat(dat = t(counts), batch = batch_lb$dataset, mod = gene.mod))
+
+gene.corr[na.gene] <- NA
+
+# gene.corr <- t(removeBatchEffect(t(counts), batch = batch_lb$dataset,
+#                                     design = gene.mod))
+
+gene.fin <- cbind(demo_gene, gene.corr)
+
+col <- as.numeric(as.factor(batch_lb$dataset))
+
+# visualization
+raw_complete <- t(gene_raw_pt[,-c(1, ncol(gene_raw_pt))]) %>% .[complete.cases(.), ]
+pca_raw <- prcomp(t(raw_complete), scale. = TRUE)
+autoplot(pca_raw, colour = col)
+
+nrm_complete <- t(counts) %>% .[complete.cases(.), ]
+pca_nrm <- prcomp(t(nrm_complete), scale. = TRUE)
+autoplot(pca_nrm, colour = col)
+
+cor_complete <- t(gene.corr) %>% .[complete.cases(.), ]
+pca_cor <- prcomp(t(cor_complete), scale. = TRUE)
+autoplot(pca_cor, colour = col)
+```
+
+```{r}
+anti.fin
+cyto.fin
+cell.fin
+gene.fin
+
+merged_data <- anti.fin %>%
+  full_join(cyto.fin, by = c("specimen_id", "subject_id")) %>%
+  full_join(cell.fin, by = c("specimen_id", "subject_id")) %>%
+  full_join(gene.fin, by = c("specimen_id", "subject_id"))
+
+merged_data <- merged_data %>%
+  select(!matches("\\.x$|\\.y$")) %>% 
+  rename_with(~ gsub("\\.x$|\\.y$", "", .))
+
+final <- df_subject_specimen %>% 
+  inner_join(merged_data, by = c("specimen_id", "subject_id"))
+```
+
+## Save data as RDS File
+```{r}
+saveRDS(final, file = "/Users/chengchangwu/Documents/Competition/3RD CMI-PB Competition/pipeline/final_df.RDS")
+```

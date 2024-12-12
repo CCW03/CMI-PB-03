@@ -1,0 +1,365 @@
+---
+title: "step4_model"
+author: "Cheng-Chang"
+date: "2024-10-19"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+library(dplyr)
+library(tidyverse)
+library(plsmselect)
+library(randomForest)
+select <- dplyr::select
+filter <- dplyr::filter
+```
+
+```{r}
+tensor_obj <- readRDS(file = "tensor.RDS")
+dm <- tensor_obj$clinical
+ten.org <- tensor_obj$exp_tensor
+ten.im <- readRDS(file = "est.tensor.im.RDS")
+
+idx <-is.na(ten.org)
+ten <- ten.org
+ten[idx] <- ten.im[idx]
+```
+
+```{r}
+dim(ten)
+bl <- ten[,,1]
+dim(bl)
+
+sv<- svd(bl)
+
+u <- sv$u
+d <- sv$d
+v <- sv$v
+plot(sv$d)
+r <- 20
+```
+
+```{r, echo=FALSE}
+pca <- prcomp(bl, rank. = r)
+plot(pca)
+cumsum(pca$sdev^2)/sum(pca$sdev^2)
+pc_ld <- pca$x
+```
+
+```{r}
+task <- "IgG_PT" # day14
+t <- 6 
+# use RF
+
+task <- "Monocytes" # day1
+t <- 2
+# use RF
+
+task <- "ENSG00000277632.1" # day3
+t <- 3
+# use RF
+
+gene.t <- ten.org[,,t]
+task_idx <- which(colnames(gene.t) == task)
+outcome <- gene.t[,task_idx]
+baseline <- ten[,task_idx,1]
+
+var <- c("infancy_vac", "biological_sex", "age")
+```
+
+```{r, eval = FALSE}
+pc <- 3
+fold <- 10
+cr_base <- 10
+
+dm_clinical <- dm %>% filter(timepoint == 0) %>%
+  mutate(age = as.numeric((date_of_boost - year_of_birth)/365.25)) %>%
+  select(all_of(var))
+
+df <- data.frame(outcome = outcome, baseline = baseline, dm_clinical, pc_ld) %>%
+  mutate(int1 = pc_ld[,1]*(as.numeric(as.factor(dm_clinical$infancy_vac))-1))
+
+df_tr <- df %>% filter(!is.na(outcome))
+df_tr$X <- model.matrix( ~ infancy_vac + biological_sex + baseline, data = df_tr)[,-1]
+
+n <- nrow(df_tr)
+idx <- sample(rep(1:fold, length.out = n))
+
+res <- array(NA, dim = c(fold, pc))
+cv.res <- array(NA, dim = c(fold, pc))
+p_var <- names(df)[-c(1:4)]
+pb <- txtProgressBar(min = 1, max = fold*pc, style = 3)
+cur <- 0
+
+for (i in 1:fold){
+  trn_idx <- i
+  train.df <- df_tr[-which(idx == i),]
+  true.tr.y <- df_tr[-which(idx == i),1]
+  test.df <- df_tr[which(idx == i),]
+  true.y <- df_tr[which(idx == i),1]
+
+  for (j in 1:pc){
+    nl_t <- paste0("s(", p_var[c(1:(j+2), length(p_var))], ", bs = 'cr', k = ", cr_base, ")")
+    formula <- as.formula(paste("outcome ~ X + ", paste(nl_t, collapse = " + ")))
+    
+    gfit = suppressMessages(gamlasso(formula, data = train.df))
+    
+    # sum(true.tr.y - predict(gfit, newdata = train.df)^2)/length(true.tr.y)
+    # sum(true.y - predict(gfit, newdata = test.df)^2)/length(true.y)
+  
+    res[i,j] <- sum((true.tr.y - predict(gfit, newdata = train.df))^2)/length(true.tr.y)
+    cv.res[i,j] <- sum((true.y - predict(gfit, newdata = test.df))^2)/length(true.y)
+    cur <- cur + 1
+    setTxtProgressBar(pb, cur)
+  }
+}
+# 
+# data.frame("cv" = colMeans(cv.res), "sample" = colMeans(res))
+```
+
+```{r, eval = FALSE}
+dm_clinical <- dm %>% filter(timepoint == 0) %>%
+  mutate(age = as.numeric((date_of_boost - year_of_birth)/365.25)) %>%
+  select(all_of(var))
+
+df <- data.frame(outcome = outcome, baseline = baseline, dm_clinical, pc_ld)
+
+df_tr <- df %>% filter(!is.na(outcome))
+df_ts <- df[116:169,]
+
+rf.res <- array(NA, dim = c(fold, 1))
+rf.cv.res <- array(NA, dim = c(fold, 1))
+
+for (i in 1:fold){
+  trn_idx <- i
+  train.df <- df_tr[-which(idx == i),]
+  true.tr.y <- df_tr[-which(idx == i),1]
+  test.df <- df_tr[which(idx == i),]
+  true.y <- df_tr[which(idx == i),1]
+  
+  n.mtry <- floor(ncol(train.df)/3)
+  rf.fit <- randomForest(outcome ~ ., data = train.df, ntree = 1000, mtry = n.mtry, 
+                           nodesize = 1, importance=T)
+  rf.res[i] <- sum((true.tr.y - predict(rf.fit, newdata = train.df))^2)/length(true.tr.y)
+  rf.cv.res[i] <- sum((true.y - predict(rf.fit, newdata = test.df))^2)/length(true.y)
+  # setTxtProgressBar(pb, i)
+}
+
+data.frame("cv" = colMeans(cv.res), "sample" = colMeans(res), "rf.cv" = colMeans(rf.cv.res), "rf.sample" = colMeans(rf.res))
+```
+# final model
+```{r}
+base <- dm %>% filter(timepoint == 0 & dataset == "2023_dataset") %>% select(subject_id)
+
+task <- "IgG_PT" # day14
+t <- 6 
+
+gene.t <- ten.org[,,t]
+task_idx <- which(colnames(gene.t) == task)
+outcome <- gene.t[,task_idx]
+baseline <- ten[,task_idx,1]
+
+var <- c("infancy_vac", "biological_sex", "age")
+
+dm_clinical <- dm %>% filter(timepoint == 0) %>%
+  mutate(age = as.numeric((date_of_boost - year_of_birth)/365.25)) %>%
+  select(all_of(var))
+
+df <- data.frame(outcome = outcome, baseline = baseline, dm_clinical, pc_ld)
+
+df_tr <- df %>% filter(!is.na(outcome))
+df_ts <- df[116:169,]
+
+n.mtry <- floor(ncol(df_tr)/3)
+rf.fit <- randomForest(outcome ~ ., data = df_tr, ntree = 1000, mtry = n.mtry, nodesize=1, importance=T)
+
+# predict(gfit, newdata = df_tr)
+df_ts$p_igg <- predict(rf.fit, newdata = df_ts)
+df_ts$true.bl <- ten.org[116:169,task_idx,1]
+
+igg <- data.frame(base, df_ts) %>% select(subject_id, true.bl, p_igg) %>%
+  arrange(-p_igg) %>% 
+  mutate(rank = row_number()) %>%
+  arrange(subject_id)
+
+igg_r <- igg %>% 
+  mutate(true.bl = exp(true.bl),
+         p_igg = exp(p_igg),
+         log_chg = p_igg/true.bl) %>%
+  arrange(-log_chg) %>% 
+  mutate(rank_r = row_number(),
+         rank_r = ifelse(is.na(true.bl), NA, rank_r)) %>%
+  arrange(subject_id)
+
+write.csv(igg_r, "task1.csv")
+```
+
+
+```{r}
+task <- "Monocytes" # day1
+t <- 2
+# use RF
+
+gene.t <- ten.org[,,t]
+task_idx <- which(colnames(gene.t) == task)
+outcome <- gene.t[,task_idx]
+baseline <- ten[,task_idx,1]
+
+var <- c("infancy_vac", "biological_sex", "age")
+
+dm_clinical <- dm %>% filter(timepoint == 0) %>%
+  mutate(age = as.numeric((date_of_boost - year_of_birth)/365.25)) %>%
+  select(all_of(var))
+
+df <- data.frame(outcome = outcome, baseline = baseline, dm_clinical, pc_ld)
+
+df_tr <- df %>% filter(!is.na(outcome))
+df_ts <- df[116:169,]
+
+n.mtry <- floor(ncol(df_tr)/3)
+rf.fit <- randomForest(outcome ~ ., data = df_tr, ntree = 1000, mtry = n.mtry, nodesize=1, importance=T)
+
+# predict(gfit, newdata = df_tr)
+df_ts$p_mon <- predict(rf.fit, newdata = df_ts)
+df_ts$true.bl <- ten.org[116:169,task_idx,1]
+
+mon <- data.frame(base, df_ts) %>% select(subject_id, true.bl, p_mon) %>%
+  arrange(-p_mon) %>% 
+  mutate(rank = row_number()) %>%
+  arrange(subject_id)
+
+mon_r <- mon %>% 
+  mutate(true.bl = exp(true.bl),
+         p_mon = exp(p_mon),
+         log_chg = p_mon/true.bl) %>%
+  arrange(-log_chg) %>% 
+  mutate(rank_r = row_number(),
+         rank_r = ifelse(is.na(true.bl), NA, rank_r)) %>%
+  arrange(subject_id)
+
+write.csv(mon_r, "task2.csv")
+```
+
+```{r}
+task <- "ENSG00000277632.1" # day3
+t <- 3
+# use RF
+
+gene.t <- ten.org[,,t]
+task_idx <- which(colnames(gene.t) == task)
+outcome <- gene.t[,task_idx]
+baseline <- ten[,task_idx,1]
+
+var <- c("infancy_vac", "biological_sex", "age")
+
+dm_clinical <- dm %>% filter(timepoint == 0) %>%
+  mutate(age = as.numeric((date_of_boost - year_of_birth)/365.25)) %>%
+  select(all_of(var))
+
+df <- data.frame(outcome = outcome, baseline = baseline, dm_clinical, pc_ld)
+
+df_tr <- df %>% filter(!is.na(outcome))
+df_ts <- df[116:169,]
+
+n.mtry <- floor(ncol(df_tr)/3)
+rf.fit <- randomForest(outcome ~ ., data = df_tr, ntree = 1000, mtry = n.mtry, nodesize=1, importance=T)
+
+# predict(gfit, newdata = df_tr)
+df_ts$p_gene <- predict(rf.fit, newdata = df_ts)
+df_ts$true.bl <- ten.org[116:169,task_idx,1]
+
+gene <- data.frame(base, df_ts) %>% select(subject_id, true.bl, p_gene) %>%
+  arrange(-p_gene) %>% 
+  mutate(rank = row_number()) %>%
+  arrange(subject_id)
+
+gene_r <- gene %>% 
+  mutate(true.bl = exp(true.bl),
+         p_gene = exp(p_gene),
+         log_chg = p_gene/true.bl) %>%
+  arrange(-log_chg) %>% 
+  mutate(rank_r = row_number(),
+         rank_r = ifelse(is.na(true.bl), NA, rank_r)) %>%
+  arrange(subject_id)
+
+write.csv(gene_r, "task3.csv")
+```
+
+```{r}
+library(mice)
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+base_dir = "../"
+dir <- paste0(base_dir, "data/")
+
+tcell <- readRDS(paste0(dir, "master_harmonized_data-2.RDS"))
+tr_polar <- tcell$training$t_cell_polarization$wide %>%
+  mutate(t_out = PT_P01579/PT_P05113)
+tr_polar <- tr_polar[,-c(2:7)]
+
+ts_polar <- tcell$challenge$t_cell_polarization$wide %>%
+  mutate(t_out = PT_P01579/PT_P05113)
+ts_polar <- ts_polar[,-c(2:7)]
+
+t_cell <- rbind(tr_polar, ts_polar)
+all_tcell <- dm %>% left_join(t_cell, by = "specimen_id") 
+bl_tcell <- all_tcell %>% filter(timepoint == 0)
+bl_tcell <- data.frame(bl_tcell, pc_ld)
+
+subj_id <- unlist(bl_tcell %>% filter(data != "2020") %>% select(subject_id))
+
+imp_bl_tcell <- bl_tcell %>% filter(data != "2020") %>%
+  mutate(age = as.numeric((date_of_boost - year_of_birth)/365.25)) %>%
+  select(all_of(var), PT_P01579, PT_Q16552, PT_P05113, t_out, starts_with("PC"))
+
+mice.imp <- mice(imp_bl_tcell, m = 100, maxit = 50, meth = 'pmm', seed = 1234)
+
+get_mode <- function(x) {
+  uniq_x <- unique(x)
+  uniq_x[which.max(tabulate(match(x, uniq_x)))]
+}
+
+mice.all <- mice::complete(mice.imp, action = "long")
+df_miceimp <- mice.all %>%
+  group_by(.id) %>%
+  summarise(across(everything(), ~ ifelse(is.numeric(.), median(.), get_mode(.)))) %>%
+  ungroup() %>%
+  select(-.imp, -.id)
+
+bl_imp_tcell <- data.frame("subject_id" = subj_id, df_miceimp[,3:7])
+tcell_outcome <- all_tcell %>% filter(timepoint == 30) %>% select(subject_id, t_out)
+
+t_cell_fin <- bl_tcell %>% select(subject_id) %>%
+  left_join(bl_imp_tcell[,c(1,6)], by = "subject_id") %>%
+  rename("t_bl" = "t_out") %>%
+  left_join(tcell_outcome, by = "subject_id")
+  
+outcome <- t_cell_fin$t_out
+baseline <- t_cell_fin$t_bl
+
+var <- c("infancy_vac", "biological_sex", "age")
+
+dm_clinical <- dm %>% filter(timepoint == 0) %>%
+  mutate(age = as.numeric((date_of_boost - year_of_birth)/365.25)) %>%
+  select(all_of(var))
+
+df <- data.frame(outcome = outcome, baseline = baseline, dm_clinical, pc_ld)
+
+df_tr <- df %>% filter(!is.na(outcome))
+df_ts <- df[116:169,]
+
+n.mtry <- floor(ncol(df_tr)/3)
+rf.fit <- randomForest(outcome ~ ., data = df_tr, ntree = 1000, mtry = n.mtry, nodesize=1, importance=T)
+
+# predict(gfit, newdata = df_tr)
+df_ts$p_tcell <- predict(rf.fit, newdata = df_ts)
+df_ts$true.bl <- unlist(bl_tcell %>% filter(data == "2023") %>% select(t_out))
+
+tcell <- data.frame(base, df_ts) %>% select(subject_id, age, true.bl, p_tcell) %>%
+  arrange(-p_tcell) %>% 
+  mutate(rank = row_number()) %>%
+  arrange(subject_id)
+
+write.csv(tcell, "task4.csv")
+```
